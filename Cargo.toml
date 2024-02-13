@@ -5,5 +5,6 @@ edition = "2021"
 
 [dependencies]
 nix = { version = "0.27.1", default-features = false, features = ["fs", "mman"] }
+slint = { version = "1.4.1", default-features = false, features = ["compat-1-2", "renderer-software", "software-renderer-systemfonts", "std"] }
 wayland-client = "0.31.1"
 wayland-protocols-wlr = { version = "0.2.0", features = ["client"] }

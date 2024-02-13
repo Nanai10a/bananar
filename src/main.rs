@@ -1,13 +1,26 @@
 #![feature(error_in_core)]
 #![feature(iterator_try_collect)]
 #![feature(never_type)]
+#![feature(slice_as_chunks)]
 #![feature(slice_from_ptr_range)]
+#![feature(slice_ptr_get)]
 #![feature(stmt_expr_attributes)]
 
 use core::error::Error;
 use wayland_client::Connection;
 
 type Result<T = (), E = Box<dyn Error + Send + Sync + 'static>> = core::result::Result<T, E>;
+
+// --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
+
+slint::slint! {
+    export component Main {
+        Text {
+            text: "hi, slint!";
+            horizontal-alignment: center;
+        }
+    }
+}
 
 // --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
 
@@ -30,17 +43,70 @@ fn main() -> Result {
 
     let mut state = state.forward(&connection)?;
 
+    let window = create_window();
+    let ui = Main::new()?;
+
+    state.windows.iter().for_each(|(w, _)| {
+        let width = w.mode.width;
+        let height = w.mode.height / 64;
+
+        w.layer_surface.set_size(width as u32, height as u32);
+        w.layer_surface.set_exclusive_zone(height as i32);
+        w.surface.commit();
+
+        window.set_size(slint::PhysicalSize::new(width as u32, height as u32));
+    });
+
+    ui.show()?;
+
     loop {
         for (w, q) in &mut state.windows {
-            w.raw.0.fill(0xff);
+            slint::platform::update_timers_and_animations();
 
-            // ^^^ --- rendering --- ^^^
+            use slint::platform::software_renderer::PremultipliedRgbaColor as Pixel;
+            let pixels = unsafe { w.raw.as_slice_mut::<Pixel>() }?;
 
-            w.surface.damage(0, 0, i32::MAX, i32::MAX);
-            w.surface.commit();
+            window.draw_if_needed(|r| {
+                r.render(pixels, w.mode.width);
+
+                w.surface.damage(0, 0, i32::MAX, i32::MAX);
+                w.surface.commit();
+            });
 
             q.roundtrip(w)?;
         }
+    }
+}
+
+// --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
+
+use std::rc::Rc;
+
+use slint::platform::software_renderer::MinimalSoftwareWindow;
+use slint::platform::WindowAdapter;
+
+fn create_window() -> Rc<MinimalSoftwareWindow> {
+    let window = MinimalSoftwareWindow::new(Default::default());
+    let platform = Platform {
+        window: window.clone(),
+    };
+
+    slint::platform::set_platform(Box::new(platform)).unwrap();
+
+    window
+}
+
+struct Platform {
+    window: Rc<MinimalSoftwareWindow>,
+}
+
+impl slint::platform::Platform for Platform {
+    fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+        Ok(self.window.clone())
+    }
+
+    fn duration_since_start(&self) -> core::time::Duration {
+        std::time::SystemTime::now().elapsed().unwrap()
     }
 }
 
@@ -264,50 +330,39 @@ use wayland_client::protocol::wl_shm_pool::WlShmPool;
 
 impl PrepareGateState {
     fn forward(mut self, connection: &Connection) -> Result<ReadyGateState> {
-        // HACK: allocate 8 [MB]
-        const POOL_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(8 * 1024 * 1024) };
-
-        let (fd, ptr) = allocate_shm(POOL_SIZE)?;
-
-        let pool = {
-            let fd = std::os::fd::AsFd::as_fd(&fd);
-
-            struct Stub;
-
-            // correctness: `wl_shm_pool` has no events
-            wayland_client::delegate_noop!(Stub: WlShmPool);
-
-            let queue = connection.new_event_queue::<Stub>();
-
-            self.shm
-                .create_pool(fd, POOL_SIZE.get() as i32, &queue.handle(), ())
-        };
-
-        let mut create_buffer = {
-            // RGBA8888 has 4 [B]
-            const PIXEL_SIZE: i32 = 4;
-            let mut offset = 0;
-
+        let create_buffer = |mode: &Mode, qh: &QueueHandle<Window>| -> Result<_> {
             use wayland_client::protocol::wl_shm::Format;
             let format = Format::Argb8888;
+            let pixel_size = 4;
 
-            move |width: i32, height: i32, handle: &QueueHandle<Window>| {
-                let stride = width * PIXEL_SIZE;
-                let buffer = pool.create_buffer(offset, width, height, stride, format, handle, ());
-                let raw = unsafe {
-                    let start = ptr.offset(offset as isize);
-                    let end = ptr.offset((offset + width * height * PIXEL_SIZE) as isize);
+            let size = mode.width * mode.height * pixel_size;
+            let raw = Shm::new(size)?;
 
-                    core::slice::from_mut_ptr_range(start..end)
-                };
+            let pool = {
+                struct Stub;
 
-                offset += width * height * PIXEL_SIZE;
-                (buffer, raw)
-            }
+                // correctness: `wl_shm_pool` has no events
+                wayland_client::delegate_noop!(Stub: WlShmPool);
+                let qh = connection.new_event_queue::<Stub>().handle();
+
+                let size = size.try_into()?;
+
+                self.shm.create_pool(raw.as_fd(), size, &qh, ())
+            };
+
+            let buffer = {
+                let w = mode.width.try_into()?;
+                let h = mode.height.try_into()?;
+                let s = (mode.width * pixel_size).try_into()?;
+
+                pool.create_buffer(0, w, h, s, format, qh, ())
+            };
+
+            Ok((buffer, raw))
         };
 
         use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
-        let layer = Layer::Overlay;
+        let layer = Layer::Background;
 
         let namespace = "namespace";
 
@@ -339,15 +394,12 @@ impl PrepareGateState {
                     (),
                 );
 
-                let width = mode.width;
-                let height = mode.height / 32;
-
-                layer_surface.set_size(width as u32, height as u32);
+                layer_surface.set_size(0, 0);
                 layer_surface.set_anchor(anchor);
-                layer_surface.set_exclusive_zone(height as i32);
+                layer_surface.set_exclusive_zone(0);
                 surface.commit();
 
-                let (buffer, raw) = create_buffer(width as i32, height as i32, handle);
+                let (buffer, raw) = create_buffer(&mode, handle)?;
 
                 let mut window = Window {
                     output,
@@ -355,7 +407,7 @@ impl PrepareGateState {
                     surface,
                     layer_surface,
                     buffer,
-                    raw: raw.into(),
+                    raw,
                 };
 
                 queue.roundtrip(&mut window)?;
@@ -426,41 +478,102 @@ impl Dispatch<WlOutput, ()> for PrepareGateState {
 
 // --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
 
-use core::num::NonZeroUsize;
+use core::ptr::NonNull;
+use std::os::fd::AsFd;
 use std::os::fd::OwnedFd;
 
-fn allocate_shm(size: NonZeroUsize) -> Result<(OwnedFd, *mut u8)> {
-    let name = {
-        let ts = std::time::SystemTime::now().elapsed().unwrap().as_nanos();
-
-        format!("/wl-shm-{ts:32x}")
-    };
-
-    let fd = {
-        use nix::fcntl::OFlag;
-        use nix::sys::stat::Mode;
-
-        let flag = OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL;
-        let mode = Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IXUSR;
-
-        nix::sys::mman::shm_open(&*name, flag, mode)?
-    };
-
-    nix::sys::mman::shm_unlink(&*name)?;
-    nix::unistd::ftruncate(&fd, size.get() as i64)?;
-
-    let ptr = {
-        use nix::sys::mman::MapFlags;
-        use nix::sys::mman::ProtFlags;
-
-        let pflag = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
-        let mflag = MapFlags::MAP_SHARED;
-
-        unsafe { nix::sys::mman::mmap(None, size, pflag, mflag, Some(&fd), 0) }?
-    };
-
-    Ok((fd, ptr as *mut u8))
+#[derive(Debug)]
+struct Shm {
+    ptr: NonNull<[u8]>,
+    fd: OwnedFd,
 }
+
+impl Shm {
+    pub fn new(size: usize) -> Result<Self> {
+        let fd = Self::open()?;
+
+        let ptr = Self::mmap(&fd, size)?;
+        let ptr = core::ptr::slice_from_raw_parts_mut(ptr, size);
+        let ptr = NonNull::new(ptr).ok_or(Unhandled)?;
+
+        Ok(Self { ptr, fd })
+    }
+
+    fn open() -> Result<OwnedFd> {
+        let name = {
+            let ts = std::time::SystemTime::now().elapsed().unwrap().as_nanos();
+
+            format!("/wl-shm-{ts:32x}")
+        };
+
+        let fd = {
+            use nix::fcntl::OFlag;
+            use nix::sys::stat::Mode;
+
+            let flag = OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL;
+            let mode = Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IXUSR;
+
+            nix::sys::mman::shm_open(&*name, flag, mode)?
+        };
+
+        nix::sys::mman::shm_unlink(&*name)?;
+
+        Ok(fd)
+    }
+
+    fn mmap<F: AsFd>(fd: F, size: usize) -> Result<*mut u8> {
+        nix::unistd::ftruncate(&fd, size.try_into()?)?;
+
+        let ptr = {
+            use nix::sys::mman::MapFlags;
+            use nix::sys::mman::ProtFlags;
+
+            let pflag = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+            let mflag = MapFlags::MAP_SHARED;
+
+            unsafe { nix::sys::mman::mmap(None, size.try_into()?, pflag, mflag, Some(&fd), 0) }?
+        };
+
+        Ok(ptr.cast::<u8>())
+    }
+
+    pub fn resize(&mut self, size: usize) -> Result<()> {
+        nix::unistd::ftruncate(&self.fd, size.try_into()?)?;
+
+        let ptr = self.ptr.as_mut_ptr();
+        let ptr = core::ptr::slice_from_raw_parts_mut(ptr, size);
+        let ptr = NonNull::new(ptr).ok_or(Unhandled)?;
+
+        self.ptr = ptr;
+
+        Ok(())
+    }
+
+    pub unsafe fn as_slice_mut<T>(&mut self) -> Result<&mut [T]> {
+        let len = self.ptr.len();
+        let ptr = self.ptr.as_mut_ptr().cast::<T>();
+        let ptr = core::ptr::slice_from_raw_parts_mut(ptr, len / core::mem::size_of::<T>());
+
+        Ok(ptr.as_mut().ok_or(Unhandled)?)
+    }
+
+    pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+// --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
+
+#[derive(Debug)]
+struct Unhandled;
+
+impl Display for Unhandled {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl Error for Unhandled {}
 
 // --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
 
@@ -483,23 +596,7 @@ struct Window {
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     buffer: WlBuffer,
-    raw: Hide<&'static mut [u8]>,
-}
-
-use core::fmt::Debug;
-
-struct Hide<T>(T);
-
-impl<T> From<T> for Hide<T> {
-    fn from(val: T) -> Self {
-        Self(val)
-    }
-}
-
-impl<T> Debug for Hide<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "<< hidden >>")
-    }
+    raw: Shm,
 }
 
 // --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
@@ -564,7 +661,7 @@ impl Dispatch<WlBuffer, ()> for Window {
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for Window {
     fn event(
-        state: &mut Self,
+        _: &mut Self,
         layer_surface: &ZwlrLayerSurfaceV1,
         event: <ZwlrLayerSurfaceV1 as Proxy>::Event,
         (): &(),
@@ -574,15 +671,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for Window {
         type Event = <ZwlrLayerSurfaceV1 as Proxy>::Event;
 
         match event {
-            Event::Configure {
-                serial,
-                width,
-                height,
-            } => {
-                if width as usize != state.mode.width || height as usize != state.mode.height / 32 {
-                    panic!()
-                }
-
+            Event::Configure { serial, .. } => {
                 layer_surface.ack_configure(serial);
             }
 
