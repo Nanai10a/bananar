@@ -14,10 +14,23 @@ type Result<T = (), E = Box<dyn Error + Send + Sync + 'static>> = core::result::
 // --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
 
 slint::slint! {
-    export component Main {
-        Text {
-            text: "hi, slint!";
-            horizontal-alignment: center;
+    export component Main inherits Window {
+        background: transparent;
+
+        default-font-family: "0xProto";
+        default-font-weight: 100;
+
+        in property<string> battery-level;
+
+        GridLayout {
+            Row {
+                Rectangle {
+                    height: 100%;
+                    border-radius: 4px;
+
+                    Text { color: #ffffff; font-size: 1.5rem; text: battery-level; }
+                }
+            }
         }
     }
 }
@@ -59,6 +72,9 @@ fn main() -> Result {
 
     ui.show()?;
 
+    let mut rbc = Transition::new(read_battery_cap, Duration::from_secs(60));
+    ui.set_battery_level(read_battery_cap());
+
     loop {
         for (w, q) in &mut state.windows {
             slint::platform::update_timers_and_animations();
@@ -73,8 +89,64 @@ fn main() -> Result {
                 w.surface.commit();
             });
 
+            // ^^^ update ^^^
+
             q.roundtrip(w)?;
+
+            // ^^^ event loop ^^^
+
+            rbc.update_if_elapsed(|ss| ui.set_battery_level(ss));
+
+            // ^^^ represent ^^^
         }
+
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+// --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
+
+fn read_battery_cap() -> slint::SharedString {
+    let Ok(raw) = std::fs::read_to_string("/sys/class/power_supply/macsmc-battery/capacity") else {
+        return slint::format!("");
+    };
+
+    let Ok(num) = raw.trim().parse::<f32>() else {
+        return slint::format!("");
+    };
+
+    slint::format!("{num}%")
+}
+
+// --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
+
+use core::time::Duration;
+use std::time::Instant;
+
+struct Transition<F> {
+    update: F,
+    interval: Duration,
+    before: Instant,
+}
+
+impl<F: FnMut() -> slint::SharedString> Transition<F> {
+    pub fn new(update: F, interval: Duration) -> Self {
+        let before = Instant::now();
+
+        Self {
+            update,
+            interval,
+            before,
+        }
+    }
+
+    pub fn update_if_elapsed(&mut self, set: impl FnOnce(slint::SharedString)) {
+        if self.before.elapsed() < self.interval {
+            return;
+        }
+
+        set((self.update)());
+        self.before = Instant::now();
     }
 }
 
