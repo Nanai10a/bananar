@@ -732,7 +732,7 @@ struct Window {
 impl Dispatch<WlSurface, ()> for Window {
     fn event(
         state: &mut Self,
-        surface: &WlSurface,
+        _: &WlSurface,
         event: <WlSurface as Proxy>::Event,
         (): &(),
         _: &Connection,
@@ -755,11 +755,13 @@ impl Dispatch<WlSurface, ()> for Window {
                 unimplemented!()
             }
 
-            Event::PreferredBufferScale { .. } | Event::PreferredBufferTransform { .. }
-                if surface.version() >= 6 =>
-            {
-                unimplemented!()
-            }
+            Event::PreferredBufferScale { .. } => {
+                dbg!(&event);
+            },
+
+            Event::PreferredBufferTransform { .. } => {
+                dbg!(&event);
+            },
 
             _ => unreachable!(),
         }
