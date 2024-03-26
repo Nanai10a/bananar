@@ -79,11 +79,15 @@ fn main() -> Result {
         for (w, q) in &mut state.windows {
             slint::platform::update_timers_and_animations();
 
-            use slint::platform::software_renderer::PremultipliedRgbaColor as Pixel;
             let pixels = unsafe { w.raw.as_slice_mut::<Pixel>() }?;
 
             window.draw_if_needed(|r| {
                 r.render(pixels, w.mode.width);
+
+                let conv = w.pp.as_converter();
+                for e in pixels {
+                    *e = conv(*e);
+                }
 
                 w.surface.damage(0, 0, i32::MAX, i32::MAX);
                 w.surface.commit();
@@ -216,7 +220,7 @@ struct InitialGateState {
     shm: Option<WlShm>,
     layer_shell: Option<ZwlrLayerShellV1>,
     outputs: Vec<LazyBind<WlOutput>>,
-    is_rgba8888_supported: bool,
+    pp: Option<PixelProxy>,
 }
 
 impl Default for InitialGateState {
@@ -226,7 +230,7 @@ impl Default for InitialGateState {
             shm: None,
             layer_shell: None,
             outputs: Vec::new(),
-            is_rgba8888_supported: false,
+            pp: None,
         }
     }
 }
@@ -246,9 +250,9 @@ impl InitialGateState {
             .layer_shell
             .ok_or_else(|| MissingError::new("zwlr_layer_shell_v1"))?;
 
-        if !self.is_rgba8888_supported {
-            return Err(MissingError::new("support of format RGBA8888").into());
-        }
+        let Some(pp) = self.pp else {
+            return Err(MissingError::new("unimplemented proxy of pixel").into());
+        };
 
         let outputs = self.outputs.iter().map(|lb| lb.bind(handle, ())).collect();
 
@@ -258,6 +262,7 @@ impl InitialGateState {
             layer_shell,
             outputs,
             modes: HashMap::new(),
+            pp,
         })
     }
 }
@@ -291,6 +296,45 @@ impl<I: Proxy + 'static> LazyBind<I> {
         data: U,
     ) -> I {
         self.registry.bind(self.name, self.version, handle, data)
+    }
+}
+
+// --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
+
+use slint::platform::software_renderer::PremultipliedRgbaColor as Pixel;
+
+#[derive(Debug, Clone, Copy)]
+enum PixelProxy {
+    Rgba8888,
+    Argb8888,
+}
+
+impl PixelProxy {
+    fn as_converter(&self) -> fn(Pixel) -> Pixel {
+        match self {
+            Self::Rgba8888 => Self::from_rgba8888,
+            Self::Argb8888 => Self::from_argb8888,
+        }
+    }
+
+    fn from_rgba8888(value: Pixel) -> Pixel {
+        value
+    }
+
+    fn from_argb8888(value: Pixel) -> Pixel {
+        let Pixel {
+            red: alpha,
+            green: red,
+            blue: green,
+            alpha: blue,
+        } = value;
+
+        Pixel {
+            red,
+            green,
+            blue,
+            alpha,
+        }
     }
 }
 
@@ -372,8 +416,11 @@ impl Dispatch<WlShm, ()> for InitialGateState {
         };
 
         use wayland_client::protocol::wl_shm::Format;
-        if let Ok(Format::Rgba8888) = format.into_result() {
-            state.is_rgba8888_supported = true;
+        match format.into_result() {
+            Ok(Format::Rgba8888) => state.pp = Some(PixelProxy::Rgba8888),
+            Ok(Format::Argb8888) => state.pp = Some(PixelProxy::Argb8888),
+
+            _ => (),
         }
     }
 }
@@ -396,15 +443,22 @@ struct PrepareGateState {
     layer_shell: ZwlrLayerShellV1,
     outputs: Vec<WlOutput>,
     modes: HashMap<ObjectId, Mode>,
+    pp: PixelProxy,
 }
 
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 
 impl PrepareGateState {
     fn forward(mut self, connection: &Connection) -> Result<ReadyGateState> {
+        let pp = self.pp;
+
         let create_buffer = |mode: &Mode, qh: &QueueHandle<Window>| -> Result<_> {
             use wayland_client::protocol::wl_shm::Format;
-            let format = Format::Argb8888;
+            let format = match pp {
+                PixelProxy::Rgba8888 => Format::Rgba8888,
+                PixelProxy::Argb8888 => Format::Argb8888,
+            };
+
             let pixel_size = 4;
 
             let size = mode.width * mode.height * pixel_size;
@@ -480,6 +534,7 @@ impl PrepareGateState {
                     layer_surface,
                     buffer,
                     raw,
+                    pp,
                 };
 
                 queue.roundtrip(&mut window)?;
@@ -669,6 +724,7 @@ struct Window {
     layer_surface: ZwlrLayerSurfaceV1,
     buffer: WlBuffer,
     raw: Shm,
+    pp: PixelProxy,
 }
 
 // --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
